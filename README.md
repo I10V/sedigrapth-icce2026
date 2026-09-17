@@ -23,6 +23,7 @@ The script analyzes multi-year monitoring datasets across three key gauging stat
 | :--- | :--- |
 | `sediment_analysis.Rmd` | Main R Markdown file containing separation functions, hydrograph plots, and pie-chart proportion grids. |
 | `sedigraph_smooth.qs` | Preprocessed continuous hydro-meteorological and sediment transport data (stored via `qs2`). |
+| `presentation.pptx` | Slides for the ICCE 2026 conference presentation. |
 | `output/` | Generated high-resolution plots (`.png`) for publication and presentation slides. |
 
 ## Methodological Workflow
