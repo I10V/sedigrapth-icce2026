@@ -1,5 +1,5 @@
 ---
-title: "Untitled"
+title: "Glacial Sediment Transport & Component Separation Analysis"
 output: html_document
 date: "2026-09-17"
 ---
