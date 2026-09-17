@@ -1,0 +1,297 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-09-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(qs2)
+library(tidyverse)
+library(zoo)
+```
+
+
+1. Load Data
+```{r}
+sedigraph_smooth = qs_read('sedigraph_smooth.qs')
+
+```
+
+
+2. Sedigraph & Component Separation Functions
+```{r}
+separate_melt_rework_rain <- function(df, r_col, year = NULL, win_short = 5, win_long = 15) {
+  r_var <- enquo(r_col)
+  
+  df_proc <- df
+  if (!is.null(year)) {
+    df_proc <- df_proc %>% filter(year(time) == as.numeric(year))
+  }
+  df_proc <- df_proc %>% filter(!is.na(!!r_var))
+  
+  if (nrow(df_proc) == 0) return(NULL)
+  
+  df_result <- df_proc %>%
+    mutate(tod = format(time, "%H:%M")) %>%
+    group_by(tod) %>%
+    arrange(time, .by_group = TRUE) %>%
+    mutate(
+      # Short window: captures amplified diurnal peaks post-floods
+      R_diurnal_fast = rollapply(!!r_var, width = win_short, FUN = median, 
+                                 align = "center", partial = TRUE, na.rm = TRUE),
+      
+      # Long window: captures baseline climatic ablation
+      R_diurnal_slow = rollapply(!!r_var, width = win_long, FUN = median, 
+                                 align = "center", partial = TRUE, na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    arrange(time) %>%
+    mutate(
+      # 1. Clean climatic ablation (lowest envelope)
+      R_melt = pmin(!!r_var, R_diurnal_slow, na.rm = TRUE),
+      
+      # 2. Channel rework (difference between fast diurnal median and melt baseline)
+      R_rework_raw = pmin(!!r_var, R_diurnal_fast, na.rm = TRUE) - R_melt,
+      R_rework = pmax(0, R_rework_raw),
+      
+      # 3. Direct rainfall / debris-flow peak
+      R_storm = pmax(0, !!r_var - R_melt - R_rework)
+    ) %>%
+    select(-tod, -R_diurnal_fast, -R_diurnal_slow, -R_rework_raw)
+  
+  return(df_result)
+}
+
+Plot_melt_rework_sedigraph <- function(sedigraph_env, YEAR, GAUGE) {
+  
+  if (is.null(sedigraph_env) || nrow(sedigraph_env) == 0) return(NULL)
+  
+  df_plot <- sedigraph_env %>%
+    select(time, R_melt, R_rework, R_storm) %>%
+    pivot_longer(
+      cols = c(R_melt, R_rework, R_storm), 
+      names_to = "Component", 
+      values_to = "Value"
+    ) %>%
+    mutate(
+      Component = factor(
+        Component, 
+        levels = c("R_storm", "R_rework", "R_melt"), # Stack order (top to bottom)
+        labels = c(
+          "Rainstorm / debris-flow peaks", 
+          "Sediment reworking", 
+          "Baseline glacial ablation"
+        )
+      )
+    )
+  
+  tz_val <- attr(df_plot$time, "tzone")
+  if (is.null(tz_val)) tz_val <- "UTC"
+  
+  start_date <- as.POSIXct(paste0(YEAR, "-06-01 00:00:00"), tz = tz_val)
+  end_date   <- as.POSIXct(paste0(YEAR, "-09-15 23:59:59"), tz = tz_val)
+  
+  p <- ggplot(df_plot, aes(x = time, y = Value, fill = Component)) +
+    geom_area(alpha = 0.85) +
+    scale_fill_manual(
+      values = c(
+        "Baseline glacial ablation"     = "#4682B4", # Steel Blue
+        "Sediment reworking"            = "#D2691E", # Chocolate/Ochre
+        "Rainstorm / debris-flow peaks" = "#DC143C"  # Crimson
+      )
+    ) +
+    scale_x_datetime(
+      limits = c(start_date, end_date),
+      date_breaks = "5 days",          
+      minor_breaks = "1 day",          
+      date_labels = "%d.%m",
+      expand = c(0.01, 0)
+    ) +
+    labs(
+      title = paste0(YEAR, ', ', GAUGE, ' — Channel Sediment Dynamics'),
+      subtitle = "Separation of sediment exhaustion phases and runoff components",
+      x = "Date (day.month)",
+      y = "Sediment load (kg/s)",
+      fill = "Runoff components:"
+    ) +
+    theme_bw() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold", size = 13),
+      axis.text.x = element_text(angle = 45, hjust = 1, face = "bold")
+    )
+  
+  return(p)
+}
+
+# Example execution for Djankuat (2025):
+p_djan25_example <- Plot_melt_rework_sedigraph(
+  sedigraph_env = separate_melt_rework_rain(
+    df = sedigraph_smooth, 
+    r_col = R_djan2025, 
+    year = 2025, 
+    win_short = 10,   # Flood adaptation window (days)
+    win_long = 90     # Pure baseline ablation window (days)
+  ),
+  YEAR = 2025,
+  GAUGE = 'Djankuat'
+)
+
+print(p_djan25_example)
+```
+
+3. Sediment Proportion Analysis & Visualization
+```{r}
+Calculate_sediment_proportions <- function(df, r_col, year, gauge, win_short = 10, win_long = 90) {
+  
+  sep_df <- separate_melt_rework_rain(
+    df = df, 
+    r_col = {{ r_col }}, 
+    year = year, 
+    win_short = win_short, 
+    win_long = win_long
+  )
+  
+  if (is.null(sep_df) || nrow(sep_df) == 0) return(NULL)
+  
+  tz_val <- attr(sep_df$time, "tzone")
+  if (is.null(tz_val)) tz_val <- "UTC"
+  
+  start_date <- as.POSIXct(paste0(year, "-06-01 00:00:00"), tz = tz_val)
+  end_date   <- as.POSIXct(paste0(year, "-09-15 23:59:59"), tz = tz_val)
+  
+  res_filtered <- sep_df %>% filter(time >= start_date & time <= end_date)
+  
+  if (nrow(res_filtered) == 0) return(NULL)
+  
+  res <- res_filtered %>%
+    summarise(
+      `Sediment reworking` = sum(R_rework, na.rm = TRUE) * 0.9,
+      `Baseline glacial ablation` = sum(R_melt, na.rm = TRUE) * 0.9,
+      `Rainstorm / debris-flow peaks` = sum(R_storm, na.rm = TRUE) * 0.9
+    ) %>%
+    pivot_longer(
+      cols = everything(), 
+      names_to = "Component", 
+      values_to = "Mass_tons"
+    ) %>%
+    mutate(
+      Year = factor(year),
+      Gauge = gauge,
+      Percent = if (sum(Mass_tons) > 0) Mass_tons / sum(Mass_tons) * 100 else 0,
+      Component = factor(
+        Component, 
+        levels = c("Rainstorm / debris-flow peaks", "Sediment reworking", "Baseline glacial ablation")
+      )
+    )
+  
+  return(res)
+}
+
+# Calculate summary dataset for pie charts:
+df_summary <- bind_rows(
+  Calculate_sediment_proportions(sedigraph_smooth, R_djan2025, 2025, 'Djankuat', 10, 90),
+  Calculate_sediment_proportions(sedigraph_smooth, R_djan2023, 2023, 'Djankuat', 10, 90),
+  Calculate_sediment_proportions(sedigraph_smooth, R_djan2020, 2020, 'Djankuat', 10, 90),
+  Calculate_sediment_proportions(sedigraph_smooth, R_djan2019, 2019, 'Djankuat', 10, 90),
+  Calculate_sediment_proportions(sedigraph_smooth, R_djan2017, 2017, 'Djankuat', 10, 90),
+  Calculate_sediment_proportions(sedigraph_smooth, R_djan2016, 2016, 'Djankuat', 10, 90),
+  Calculate_sediment_proportions(sedigraph_smooth, R_djan2015, 2015, 'Djankuat', 10, 90),
+  Calculate_sediment_proportions(sedigraph_smooth, R_tyrnauz,  2025, 'Baksan, Tyrnyauz', 10, 90),
+  Calculate_sediment_proportions(sedigraph_smooth, R_zayukovo, 2025, 'Baksan, Zayukovo', 10, 90)
+)
+
+# Plot pie chart matrix:
+p_pies <- ggplot(df_summary, aes(x = "", y = Percent, fill = Component)) +
+  geom_bar(stat = "identity", width = 1, color = "white", linewidth = 0.3) +
+  coord_polar(theta = "y") +
+  geom_text(
+    aes(label = ifelse(Percent > 4, paste0(round(Percent, 1), "%"), "")),
+    position = position_stack(vjust = 0.5),
+    size = 3,
+    fontface = "bold",
+    color = "white"
+  ) +
+  facet_grid(Gauge ~ Year, drop = TRUE) +
+  scale_fill_manual(
+    values = c(
+      "Baseline glacial ablation"     = "#4682B4", # Steel Blue
+      "Sediment reworking"            = "#D2691E", # Chocolate/Ochre
+      "Rainstorm / debris-flow peaks" = "#DC143C"  # Crimson
+    )
+  ) +
+  labs(
+    title = "Proportion of Sediment Runoff Components by Gauge and Year",
+    subtitle = "Calculation for the period June 01 - September 15",
+    fill = "Runoff components:"
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, margin = margin(b = 10)),
+    strip.text.x = element_text(size = 11, face = "bold"),
+    strip.text.y = element_text(size = 11, face = "bold", angle = 270),
+    panel.spacing = unit(1, "lines")
+  )
+
+print(p_pies)
+```
+
+4. Export Figures
+```{r}
+# Create output folder if it doesn't exist
+if (!dir.exists("output")) dir.create("output")
+
+# Generate and save Djankuat hydrograph (2025)
+p_djan25 <- Plot_melt_rework_sedigraph(
+  sedigraph_env = separate_melt_rework_rain(
+    df = sedigraph_smooth, 
+    r_col = R_djan2025, 
+    year = 2025, 
+    win_short = 10, 
+    win_long = 90
+  ),
+  YEAR = 2025,
+  GAUGE = 'Djankuat'
+)
+
+print(p_djan25)
+
+ggsave(
+  plot = p_djan25, 
+  filename = 'output/Djankuat_2025_Separated.png', 
+  width = 12, 
+  height = 6, 
+  dpi = 300
+)
+
+# Generate and save Zayukovo hydrograph (2025)
+p_zayukovo25 <- Plot_melt_rework_sedigraph(
+  sedigraph_env = separate_melt_rework_rain(
+    df = sedigraph_smooth, 
+    r_col = R_zayukovo, 
+    year = 2025, 
+    win_short = 10, 
+    win_long = 90
+  ),
+  YEAR = 2025,
+  GAUGE = 'Baksan, Zayukovo'
+)
+
+print(p_zayukovo25)
+
+ggsave(
+  plot = p_zayukovo25, 
+  filename = 'output/Zayukovo_2025_Separated.png', 
+  width = 12, 
+  height = 6, 
+  dpi = 300
+)
+```
+
